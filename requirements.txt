@@ -1,0 +1,5 @@
+pyspark==3.3.0
+delta-spark==2.2.0
+great-expectations==0.15.0
+pytest==7.0.0
+pytest-cov==3.0.0
