@@ -4,12 +4,12 @@
 # =============================================================
 # Reads live order events from Azure Event Hubs using Databricks
 # Structured Streaming. Writes raw events to Bronze Delta Lake
-# table with exactly-once checkpoint guarantees.
+# table with exactly-once checkpoint guarantees via ADLS Gen2.
 #
 # Layer    : Bronze (raw — never modified)
-# Trigger  : 60-second micro-batch
-# Output   : akhilstream_db.bronze_order_events (Delta)
-# Tech     : PySpark · Azure Event Hubs · Delta Lake · Databricks
+# Trigger  : 30-second micro-batch (faster ingestion)
+# Output   : akhilstream_db.bronze_order_events (Delta on ADLS)
+# Tech     : PySpark · Azure Event Hubs · Delta Lake · ADLS Gen2
 # Author   : Akhil Bakki
 # =============================================================
 
@@ -20,44 +20,52 @@ from pyspark.sql.types import (
 )
 
 # ------------------------------------------------------------------
-# STEP 1 — Set up database
+# STEP 1 — ADLS Gen2 + Database configuration
 # ------------------------------------------------------------------
+STORAGE_ACCOUNT = dbutils.secrets.get("shopstream-scope", "adls-account-name")
+ACCESS_KEY       = dbutils.secrets.get("shopstream-scope", "adls-access-key")
+CONTAINER        = "shopstream-data"
+
+spark.conf.set(
+    f"fs.azure.account.key.{STORAGE_ACCOUNT}.dfs.core.windows.net",
+    ACCESS_KEY
+)
+
+BASE_PATH     = f"abfss://{CONTAINER}@{STORAGE_ACCOUNT}.dfs.core.windows.net"
+BRONZE_CP     = f"{BASE_PATH}/checkpoints/bronze_orders"
+
 spark.sql("USE CATALOG hive_metastore")
 spark.sql("CREATE DATABASE IF NOT EXISTS akhilstream_db")
 spark.sql("USE DATABASE akhilstream_db")
-print("✅ Database ready:", spark.catalog.currentDatabase())
+
+print("✅ ADLS Gen2 configured :", BASE_PATH)
+print("✅ Database ready       :", spark.catalog.currentDatabase())
 
 # ------------------------------------------------------------------
-# STEP 2 — Clear old checkpoint (only needed on first run or error)
+# STEP 2 — Spark performance tuning for faster ingestion
 # ------------------------------------------------------------------
-checkpoint_path = "dbfs:/shopstream/checkpoints/bronze_orders"
+spark.conf.set("spark.sql.shuffle.partitions", "8")
+spark.conf.set("spark.databricks.delta.optimizeWrite.enabled", "true")
+spark.conf.set("spark.databricks.delta.autoCompact.enabled", "true")
+spark.conf.set("spark.sql.streaming.stateStore.providerClass",
+               "com.databricks.sql.streaming.state.RocksDBStateStoreProvider")
 
+print("✅ Spark performance tuning applied")
+
+# ------------------------------------------------------------------
+# STEP 3 — Clear old checkpoint for fresh start
+# ------------------------------------------------------------------
 try:
-    dbutils.fs.rm(checkpoint_path, recurse=True)
+    dbutils.fs.rm(BRONZE_CP, recurse=True)
     print("✅ Old checkpoint cleared")
 except:
-    print("ℹ️  No existing checkpoint found — fresh start")
+    print("ℹ️  No existing checkpoint — fresh start")
 
-# Create checkpoint directory
-dbutils.fs.mkdirs(checkpoint_path)
-print("✅ Checkpoint directory created:", checkpoint_path)
-
-# ------------------------------------------------------------------
-# STEP 3 — Verify Event Hubs connection string has EntityPath
-# ------------------------------------------------------------------
-conn_str = dbutils.secrets.get(scope="akhilstream-scope", key="eh-conn-str") + ';EntityPath=order-events' if 'EntityPath' not in dbutils.secrets.get(scope="akhilstream-scope", key="eh-conn-str") else dbutils.secrets.get(scope="akhilstream-scope", key="eh-conn-str")
-
-if "EntityPath" not in conn_str:
-    raise ValueError(
-        "❌ EntityPath missing from connection string!\n"
-        "Add ;EntityPath=order-events at the end of your secret.\n"
-        "Example: Endpoint=sb://...;SharedAccessKey=...;EntityPath=order-events"
-    )
-
-print("✅ EntityPath found in connection string — good to go!")
+dbutils.fs.mkdirs(BRONZE_CP)
+print("✅ Checkpoint directory created:", BRONZE_CP)
 
 # ------------------------------------------------------------------
-# STEP 4 — Schema matching the order event producer payload
+# STEP 4 — Schema matching order event producer payload
 # ------------------------------------------------------------------
 ORDER_SCHEMA = StructType([
     StructField("order_id",        StringType(),   True),
@@ -76,20 +84,34 @@ ORDER_SCHEMA = StructType([
 print("✅ Schema defined")
 
 # ------------------------------------------------------------------
-# STEP 5 — Event Hubs configuration
-#    Connection string retrieved from Databricks Secret Scope
-#    EntityPath=order-events must be included in the secret
+# STEP 5 — Verify Event Hubs connection string
+# ------------------------------------------------------------------
+conn_str = dbutils.secrets.get(scope="shopstream-scope", key="eh-conn-str")
+
+if "EntityPath" not in conn_str:
+    raise ValueError(
+        "❌ EntityPath missing!\n"
+        "Add ;EntityPath=order-events at the end of your secret."
+    )
+print("✅ EntityPath found in connection string")
+
+# ------------------------------------------------------------------
+# STEP 6 — Event Hubs configuration
 # ------------------------------------------------------------------
 ehConf = {
     "eventhubs.connectionString": sc._jvm.org.apache.spark.eventhubs.EventHubsUtils.encrypt(conn_str),
     "eventhubs.consumerGroup":    "$Default",
-    "eventhubs.startingPosition": '{"offset":"-1","seqNo":-1,"enqueuedTime":null,"isInclusive":true}'
+    "eventhubs.startingPosition": '{"offset":"-1","seqNo":-1,"enqueuedTime":null,"isInclusive":true}',
+    "eventhubs.maxEventsPerTrigger": "50000",
+    "eventhubs.prefetchCount":       "999",
+    "eventhubs.receiverTimeout":     "PT1M",
+    "eventhubs.operationTimeout":    "PT1M"
 }
 
-print("✅ Event Hubs config ready")
+print("✅ Event Hubs config ready — maxEventsPerTrigger: 50000")
 
 # ------------------------------------------------------------------
-# STEP 6 — Read stream from Azure Event Hubs
+# STEP 7 — Read stream from Azure Event Hubs
 # ------------------------------------------------------------------
 raw_stream = (
     spark.readStream
@@ -101,7 +123,7 @@ raw_stream = (
 print("✅ Stream reader created")
 
 # ------------------------------------------------------------------
-# STEP 7 — Parse JSON payload + add ingestion timestamp
+# STEP 8 — Parse JSON payload + add ingestion metadata
 # ------------------------------------------------------------------
 bronze_df = (
     raw_stream
@@ -115,50 +137,56 @@ bronze_df = (
 print("✅ Transformation defined")
 
 # ------------------------------------------------------------------
-# STEP 8 — Write to Bronze Delta table
-#    append mode — raw data never modified
-#    60s micro-batch trigger
-#    checkpoint — exactly-once guarantee on restart
+# STEP 9 — Write to Bronze Delta table on ADLS Gen2
+#    30s trigger for faster ingestion
+#    maxFilesPerTrigger for better small file handling
 # ------------------------------------------------------------------
-print("🚀 Starting Bronze streaming job...")
-print("   Checkpoint : dbfs:/shopstream/checkpoints/bronze_orders")
-print("   Table      : akhilstream_db.bronze_order_events")
-print("   Trigger    : 60 seconds")
-print("   Output mode: append")
-print("")
-print("⏳ Wait ~2 minutes then verify:")
-print("   SELECT count(*) FROM akhilstream_db.bronze_order_events")
+print("\n🚀 Starting Bronze streaming job...")
+print(f"   Checkpoint  : {BRONZE_CP}")
+print(f"   Table       : akhilstream_db.bronze_order_events")
+print(f"   Trigger     : 30 seconds")
+print(f"   Output mode : append")
+print(f"   Storage     : ADLS Gen2 → {STORAGE_ACCOUNT}")
+
+BRONZE_DELTA_PATH = f"{BASE_PATH}/delta/bronze"
 
 query = (
     bronze_df.writeStream
     .format("delta")
     .outputMode("append")
-    .trigger(processingTime="60 seconds")
-    .option("checkpointLocation", checkpoint_path)
-    .toTable("hive_metastore.akhilstream_db.bronze_order_events")
+    .trigger(processingTime="30 seconds")
+    .option("checkpointLocation", BRONZE_CP)
+    .option("mergeSchema", "true")
+    .start(BRONZE_DELTA_PATH)       # ← write directly to ADLS path
 )
 
+# Register as table so SQL queries still work
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS hive_metastore.akhilstream_db.bronze_order_events
+    USING DELTA
+    LOCATION '{BRONZE_DELTA_PATH}'
+""")
+
 # ------------------------------------------------------------------
-# STEP 9 — Monitor stream status
+# STEP 10 — Monitor stream status
 # ------------------------------------------------------------------
 import time
-time.sleep(10)
+time.sleep(15)
 
-status = query.status
 print("\n📊 Stream status:")
-print("   Message       :", status["message"])
-print("   Is active     :", query.isActive)
-print("   Recent progress:", query.lastProgress)
+print("   Is active:", query.isActive)
+print("   Message  :", query.status["message"])
+
+print("\n⏳ Verify after ~2 minutes:")
+print("   SELECT count(*) FROM akhilstream_db.bronze_order_events")
 
 # ------------------------------------------------------------------
 # Sample output after ~2 minutes:
-# SELECT * FROM akhilstream_db.bronze_order_events LIMIT 5;
-#
-# +-----------+-------------+------------+-------------+--------------+----------------+--------+-------------+----------+------------+---------------------------+---------------------------+
-# | order_id  | customer_id | product_id | category    | order_status | payment_method | region | order_value | quantity | is_returned| event_ts                  | ingested_at               |
-# +-----------+-------------+------------+-------------+--------------+----------------+--------+-------------+----------+------------+---------------------------+---------------------------+
-# | ORD234891 | CUST_7821   | PROD_4421  | Electronics | PLACED       | CREDIT_CARD    | WEST   | 299.99      | 1        | false      | 2025-07-03T10:45:23+00:00 | 2025-07-03 10:46:01       |
-# | ORD234892 | CUST_3312   | PROD_2201  | Fashion     | SHIPPED      | UPI            | SOUTH  | 49.99       | 2        | false      | 2025-07-03T10:45:24+00:00 | 2025-07-03 10:46:01       |
-# | ORD234893 | CUST_9901   | PROD_8801  | Grocery     | DELIVERED    | COD            | NORTH  | 18.50       | 5        | true       | 2025-07-03T10:45:25+00:00 | 2025-07-03 10:46:01       |
-# +-----------+-------------+------------+-------------+--------------+----------------+--------+-------------+----------+------------+---------------------------+---------------------------+
+# +-----------+-------------+------------+-------------+--------------+
+# | order_id  | customer_id | category   | order_status| order_value  |
+# +-----------+-------------+------------+-------------+--------------+
+# | ORD234891 | CUST_7821   | Electronics| PLACED      | 299.99       |
+# | ORD234892 | CUST_3312   | Fashion    | SHIPPED     | 49.99        |
+# | ORD234893 | CUST_9901   | Grocery    | DELIVERED   | 18.50        |
+# +-----------+-------------+------------+-------------+--------------+
 # ------------------------------------------------------------------
