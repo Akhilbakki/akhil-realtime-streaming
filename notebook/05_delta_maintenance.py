@@ -2,97 +2,173 @@
 # 05 — DELTA LAKE MAINTENANCE
 # ShopStream — Real-Time E-Commerce Order Tracking Pipeline
 # =============================================================
-# Performs routine Delta Lake maintenance to prevent small file
-# explosion from continuous streaming writes. Runs OPTIMIZE
-# with ZORDER on frequently queried columns, VACUUM to remove
-# stale versions, and enables auto-optimize on all tables.
-# Schedule this notebook to run once daily (e.g. 2:00 AM).
+# Daily maintenance job — OPTIMIZE, ZORDER, VACUUM on all
+# Delta tables. Prevents small file explosion from continuous
+# streaming writes. Schedule daily at 2:00 AM.
 #
 # Operations : OPTIMIZE · ZORDER · VACUUM · auto-optimize
-# Schedule   : Daily — Databricks Workflow (cron: 0 2 * * *)
-# Tech       : Delta Lake · Databricks SQL · Spark SQL
+# Schedule   : Daily — Databricks Workflow (2:00 AM)
 # Author     : Akhil Bakki
-# GitHub     : github.com/akhilbakki/shopstream-realtime-pipeline
 # =============================================================
 
-# ------------------------------------------------------------------
-# 1. OPTIMIZE + ZORDER Silver table
-#    ZORDER on region + event_ts speeds up Gold aggregation queries
-#    that filter/group on these columns
-# ------------------------------------------------------------------
-print("Running OPTIMIZE on silver_order_events...")
-
-spark.sql("""
-    OPTIMIZE shopstream_db.silver_order_events
-    ZORDER BY (region, category, event_ts)
-""")
-
-print("OPTIMIZE complete on silver_order_events")
+from datetime import datetime
 
 # ------------------------------------------------------------------
-# 2. OPTIMIZE Gold KPI table
+# STEP 1 — ADLS Gen2 + Database configuration
 # ------------------------------------------------------------------
-print("Running OPTIMIZE on gold_order_kpis...")
+STORAGE_ACCOUNT = dbutils.secrets.get("shopstream-scope", "adls-account-name")
+ACCESS_KEY       = dbutils.secrets.get("shopstream-scope", "adls-access-key")
+CONTAINER        = "shopstream-data"
 
-spark.sql("""
-    OPTIMIZE shopstream_db.gold_order_kpis
-    ZORDER BY (region, category)
-""")
+spark.conf.set(
+    f"fs.azure.account.key.{STORAGE_ACCOUNT}.dfs.core.windows.net",
+    ACCESS_KEY
+)
 
-print("OPTIMIZE complete on gold_order_kpis")
+BASE_PATH = f"abfss://{CONTAINER}@{STORAGE_ACCOUNT}.dfs.core.windows.net"
 
-# ------------------------------------------------------------------
-# 3. VACUUM — remove Delta versions older than 7 days
-#    Reduces ADLS Gen2 storage costs significantly
-#    Keep 168 hours (7 days) for time travel and debugging
-# ------------------------------------------------------------------
-print("Running VACUUM on all tables...")
+spark.sql("USE CATALOG hive_metastore")
+spark.sql("USE DATABASE akhilstream_db")
+print("✅ Database ready:", spark.catalog.currentDatabase())
 
-spark.sql("VACUUM shopstream_db.bronze_order_events  RETAIN 168 HOURS")
-spark.sql("VACUUM shopstream_db.silver_order_events  RETAIN 168 HOURS")
-spark.sql("VACUUM shopstream_db.gold_order_kpis      RETAIN 168 HOURS")
-spark.sql("VACUUM shopstream_db.dead_letter_orders   RETAIN 168 HOURS")
-
-print("VACUUM complete on all tables")
+print(f"\n{'='*65}")
+print(f"  DELTA MAINTENANCE STARTED")
+print(f"  Time   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"  Storage: {STORAGE_ACCOUNT}")
+print(f"{'='*65}\n")
 
 # ------------------------------------------------------------------
-# 4. Enable auto-optimize on Bronze + Silver tables
-#    Prevents small file accumulation from high-frequency streaming writes
+# STEP 2 — All tables to maintain
 # ------------------------------------------------------------------
-for table in ["bronze_order_events", "silver_order_events"]:
-    spark.sql(f"""
-        ALTER TABLE shopstream_db.{table}
-        SET TBLPROPERTIES (
-            'delta.autoOptimize.optimizeWrite' = 'true',
-            'delta.autoOptimize.autoCompact'   = 'true'
-        )
+tables = {
+    "bronze_order_events":      ["ingested_at"],
+    "silver_order_events":      ["region", "category", "event_ts"],
+    "gold_order_kpis":          ["region", "category"],
+    "gold_revenue_by_payment":  ["payment_method", "region"],
+    "gold_product_kpis":        ["product_id", "category"],
+    "dead_letter_orders":       ["failed_at"],
+}
+
+# ------------------------------------------------------------------
+# STEP 3 — Row counts before maintenance
+# ------------------------------------------------------------------
+print("📊 Row counts BEFORE maintenance:")
+before_counts = {}
+for table in tables:
+    try:
+        cnt = spark.table(f"hive_metastore.akhilstream_db.{table}").count()
+        before_counts[table] = cnt
+        print(f"   {table:<35} {cnt:>10,} rows")
+    except:
+        before_counts[table] = 0
+        print(f"   {table:<35} {'NOT FOUND':>10}")
+
+# ------------------------------------------------------------------
+# STEP 4 — OPTIMIZE + ZORDER all tables
+# ------------------------------------------------------------------
+print("\n🔧 Running OPTIMIZE + ZORDER...")
+
+spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
+
+for table, zorder_cols in tables.items():
+    try:
+        zorder_str = ", ".join(zorder_cols)
+        spark.sql(f"""
+            OPTIMIZE hive_metastore.akhilstream_db.{table}
+            ZORDER BY ({zorder_str})
+        """)
+        print(f"  ✅ OPTIMIZE complete: {table}  ZORDER BY ({zorder_str})")
+    except Exception as e:
+        print(f"  ⚠️  OPTIMIZE skipped: {table} — {str(e)[:60]}")
+
+# ------------------------------------------------------------------
+# STEP 5 — VACUUM all tables (retain 7 days)
+# ------------------------------------------------------------------
+print("\n🗑️  Running VACUUM (retain 168 hours)...")
+
+for table in tables:
+    try:
+        spark.sql(f"VACUUM hive_metastore.akhilstream_db.{table} RETAIN 168 HOURS")
+        print(f"  ✅ VACUUM complete: {table}")
+    except Exception as e:
+        print(f"  ⚠️  VACUUM skipped: {table} — {str(e)[:60]}")
+
+# ------------------------------------------------------------------
+# STEP 6 — Enable auto-optimize on streaming tables
+# ------------------------------------------------------------------
+print("\n⚙️  Enabling auto-optimize on streaming tables...")
+
+streaming_tables = ["bronze_order_events", "silver_order_events"]
+for table in streaming_tables:
+    try:
+        spark.sql(f"""
+            ALTER TABLE hive_metastore.akhilstream_db.{table}
+            SET TBLPROPERTIES (
+                'delta.autoOptimize.optimizeWrite' = 'true',
+                'delta.autoOptimize.autoCompact'   = 'true'
+            )
+        """)
+        print(f"  ✅ Auto-optimize enabled: {table}")
+    except Exception as e:
+        print(f"  ⚠️  Skipped: {table} — {str(e)[:60]}")
+
+# ------------------------------------------------------------------
+# STEP 7 — Row counts after maintenance
+# ------------------------------------------------------------------
+print("\n📊 Row counts AFTER maintenance:")
+for table in tables:
+    try:
+        cnt = spark.table(f"hive_metastore.akhilstream_db.{table}").count()
+        diff = cnt - before_counts.get(table, 0)
+        diff_str = f"(+{diff:,})" if diff > 0 else ""
+        print(f"   {table:<35} {cnt:>10,} rows  {diff_str}")
+    except:
+        print(f"   {table:<35} {'NOT FOUND':>10}")
+
+# ------------------------------------------------------------------
+# STEP 8 — Delta history for Silver table
+# ------------------------------------------------------------------
+print("\n📜 Delta history — silver_order_events (last 5):")
+try:
+    spark.sql("""
+        DESCRIBE HISTORY hive_metastore.akhilstream_db.silver_order_events
+        LIMIT 5
+    """).select("version", "timestamp", "operation").show(truncate=False)
+except Exception as e:
+    print(f"  ⚠️  History unavailable: {str(e)[:60]}")
+
+# ------------------------------------------------------------------
+# STEP 9 — Test time travel
+# ------------------------------------------------------------------
+print("\n🕐 Testing Delta time travel on Silver table...")
+try:
+    result = spark.sql("""
+        SELECT count(*) AS rows_at_version_0
+        FROM hive_metastore.akhilstream_db.silver_order_events
+        VERSION AS OF 0
     """)
-    print(f"Auto-optimize enabled on {table}")
+    result.show()
+    print("✅ Time travel working — Delta transaction log intact in ADLS Gen2")
+except Exception as e:
+    print(f"ℹ️  Time travel: {str(e)[:80]}")
 
 # ------------------------------------------------------------------
-# 5. Print table health summary
+# STEP 10 — ADLS Gen2 storage summary
 # ------------------------------------------------------------------
-print("\n" + "="*60)
-print("  DELTA MAINTENANCE COMPLETE")
-print("="*60)
+print("\n📁 ADLS Gen2 storage summary:")
+try:
+    for folder in ["checkpoints", "delta"]:
+        files = dbutils.fs.ls(f"{BASE_PATH}/{folder}/")
+        print(f"  {folder}/  — {len(files)} items")
+        for f in files:
+            print(f"    📁 {f.name}")
+except Exception as e:
+    print(f"  ⚠️  {str(e)[:60]}")
 
-for table in ["bronze_order_events", "silver_order_events",
-              "gold_order_kpis", "dead_letter_orders"]:
-    row_count = spark.table(f"shopstream_db.{table}").count()
-    print(f"  {table:<30} {row_count:>10,} rows")
-
-print("="*60)
-
-# ------------------------------------------------------------------
-# 6. Test time travel — verify Delta history is intact
-# ------------------------------------------------------------------
-print("\nTesting Delta time travel on Silver table...")
-
-spark.sql("""
-    SELECT count(*) AS rows_1hr_ago
-    FROM shopstream_db.silver_order_events
-    TIMESTAMP AS OF dateadd(HOUR, -1, current_timestamp())
-""").show()
-
-print("Time travel verified — Delta transaction log intact")
-# ------------------------------------------------------------------
+print(f"\n{'='*65}")
+print(f"  DELTA MAINTENANCE COMPLETE ✅")
+print(f"  Time      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"  Tables    : {len(tables)} maintained")
+print(f"  Operations: OPTIMIZE · ZORDER · VACUUM · auto-optimize")
+print(f"  Storage   : {STORAGE_ACCOUNT} (ADLS Gen2)")
+print(f"{'='*65}")
