@@ -2,14 +2,14 @@
 # 02 — SILVER TRANSFORMATION
 # ShopStream — Real-Time E-Commerce Order Tracking Pipeline
 # =============================================================
-# Reads from Bronze Delta table and applies data quality rules:
+# Reads from Bronze Delta table, applies data quality rules:
 # null validation, type casting, value range checks, and
 # deduplication. Invalid records routed to dead-letter table.
 #
 # Layer    : Silver (cleaned, validated, deduplicated)
-# Trigger  : 60-second micro-batch
-# Output   : akhilstream_db.silver_order_events (Delta)
-#            akhilstream_db.dead_letter_orders  (Delta)
+# Trigger  : 30-second micro-batch
+# Output   : akhilstream_db.silver_order_events (Delta on ADLS)
+#            akhilstream_db.dead_letter_orders  (Delta on ADLS)
 # Tech     : PySpark · Delta Lake · Databricks Structured Streaming
 # Author   : Akhil Bakki
 # =============================================================
@@ -19,15 +19,39 @@ from pyspark.sql.functions import (
 )
 
 # ------------------------------------------------------------------
-# STEP 1 — Set up database
+# STEP 1 — ADLS Gen2 + Database configuration
 # ------------------------------------------------------------------
+STORAGE_ACCOUNT = dbutils.secrets.get("shopstream-scope", "adls-account-name")
+ACCESS_KEY       = dbutils.secrets.get("shopstream-scope", "adls-access-key")
+CONTAINER        = "shopstream-data"
+
+spark.conf.set(
+    f"fs.azure.account.key.{STORAGE_ACCOUNT}.dfs.core.windows.net",
+    ACCESS_KEY
+)
+
+BASE_PATH     = f"abfss://{CONTAINER}@{STORAGE_ACCOUNT}.dfs.core.windows.net"
+SILVER_CP     = f"{BASE_PATH}/checkpoints/silver_orders"
+DEADLETTER_CP = f"{BASE_PATH}/checkpoints/dead_letter_orders"
+
 spark.sql("USE CATALOG hive_metastore")
 spark.sql("CREATE DATABASE IF NOT EXISTS akhilstream_db")
 spark.sql("USE DATABASE akhilstream_db")
-print("✅ Database ready:", spark.catalog.currentDatabase())
+
+print("✅ ADLS Gen2 configured :", BASE_PATH)
+print("✅ Database ready       :", spark.catalog.currentDatabase())
 
 # ------------------------------------------------------------------
-# STEP 2 — Verify Bronze table has data before starting
+# STEP 2 — Spark performance tuning
+# ------------------------------------------------------------------
+spark.conf.set("spark.sql.shuffle.partitions", "8")
+spark.conf.set("spark.databricks.delta.optimizeWrite.enabled", "true")
+spark.conf.set("spark.databricks.delta.autoCompact.enabled", "true")
+
+print("✅ Spark performance tuning applied")
+
+# ------------------------------------------------------------------
+# STEP 3 — Verify Bronze table has data
 # ------------------------------------------------------------------
 bronze_count = spark.table("hive_metastore.akhilstream_db.bronze_order_events").count()
 print(f"✅ Bronze table has {bronze_count:,} rows — ready to process")
@@ -35,61 +59,54 @@ print(f"✅ Bronze table has {bronze_count:,} rows — ready to process")
 if bronze_count == 0:
     raise ValueError(
         "❌ Bronze table is empty!\n"
-        "Make sure notebook 01_bronze_ingestion is running first\n"
-        "and wait at least 2 minutes before running this notebook."
+        "Run notebook 01_bronze_ingestion first and wait 2 minutes."
     )
 
 # ------------------------------------------------------------------
-# STEP 3 — Clear old checkpoints (first run or after error)
+# STEP 4 — Clear old checkpoints
 # ------------------------------------------------------------------
-silver_checkpoint     = "dbfs:/shopstream/checkpoints/silver_orders"
-deadletter_checkpoint = "dbfs:/shopstream/checkpoints/dead_letter_orders"
-
-for path in [silver_checkpoint, deadletter_checkpoint]:
+for path in [SILVER_CP, DEADLETTER_CP]:
     try:
         dbutils.fs.rm(path, recurse=True)
-        print(f"✅ Cleared checkpoint: {path}")
+        print(f"✅ Cleared: {path}")
     except:
         print(f"ℹ️  No existing checkpoint: {path}")
 
-dbutils.fs.mkdirs(silver_checkpoint)
-dbutils.fs.mkdirs(deadletter_checkpoint)
+dbutils.fs.mkdirs(SILVER_CP)
+dbutils.fs.mkdirs(DEADLETTER_CP)
 print("✅ Checkpoint directories created")
 
 # ------------------------------------------------------------------
-# STEP 4 — Read stream from Bronze Delta table
-#    Delta readStream picks up new micro-batches as Bronze
-#    ingestion writes them every 60 seconds
+# STEP 5 — Read stream from Bronze Delta table
 # ------------------------------------------------------------------
 bronze_stream = (
     spark.readStream
     .format("delta")
+    .option("maxFilesPerTrigger", "10")
     .table("hive_metastore.akhilstream_db.bronze_order_events")
 )
 
 print("✅ Bronze stream reader created")
 
 # ------------------------------------------------------------------
-# STEP 5 — Define validation rules
-#    Records failing ANY condition → dead-letter table
-#    Records passing ALL conditions → Silver table
+# STEP 6 — Validation rules
 # ------------------------------------------------------------------
 valid_condition = (
-    col("order_id").isNotNull()        &
-    col("customer_id").isNotNull()     &
-    col("order_status").isNotNull()    &
-    col("region").isNotNull()          &
-    col("order_value").isNotNull()     &
-    (col("order_value") > 0)             &
-    col("quantity").isNotNull()        &
-    (col("quantity") > 0)                &
+    col("order_id").isNotNull()     &
+    col("customer_id").isNotNull()  &
+    col("order_status").isNotNull() &
+    col("region").isNotNull()       &
+    col("order_value").isNotNull()  &
+    (col("order_value") > 0)        &
+    col("quantity").isNotNull()     &
+    (col("quantity") > 0)           &
     col("event_ts").isNotNull()
 )
 
 print("✅ Validation rules defined")
 
 # ------------------------------------------------------------------
-# STEP 6 — Silver — clean, cast, standardise
+# STEP 7 — Silver — clean, cast, standardise
 # ------------------------------------------------------------------
 silver_df = (
     bronze_stream
@@ -103,7 +120,7 @@ silver_df = (
 )
 
 # ------------------------------------------------------------------
-# STEP 7 — Dead letter — invalid records for investigation
+# STEP 8 — Dead letter — invalid records
 # ------------------------------------------------------------------
 dead_letter_df = (
     bronze_stream
@@ -114,66 +131,55 @@ dead_letter_df = (
 print("✅ Silver and Dead Letter transformations defined")
 
 # ------------------------------------------------------------------
-# STEP 8 — Write Silver stream
+# STEP 9 — Write Silver stream
 # ------------------------------------------------------------------
 print("\n🚀 Starting Silver streaming job...")
-print("   Checkpoint : dbfs:/shopstream/checkpoints/silver_orders")
-print("   Table      : akhilstream_db.silver_order_events")
-print("   Trigger    : 60 seconds")
-print("   Output mode: append")
+SILVER_DELTA_PATH     = f"{BASE_PATH}/delta/silver"
+DEADLETTER_DELTA_PATH = f"{BASE_PATH}/delta/dead_letter"
 
 silver_query = (
     silver_df.writeStream
     .format("delta")
     .outputMode("append")
-    .trigger(processingTime="60 seconds")
-    .option("checkpointLocation", silver_checkpoint)
-    .toTable("hive_metastore.akhilstream_db.silver_order_events")
+    .trigger(processingTime="30 seconds")
+    .option("checkpointLocation", SILVER_CP)
+    .option("mergeSchema", "true")
+    .start(SILVER_DELTA_PATH)
 )
-
-# ------------------------------------------------------------------
-# STEP 9 — Write Dead Letter stream
-# ------------------------------------------------------------------
-print("\n🚀 Starting Dead Letter streaming job...")
-print("   Checkpoint : dbfs:/shopstream/checkpoints/dead_letter_orders")
-print("   Table      : akhilstream_db.dead_letter_orders")
 
 dead_letter_query = (
     dead_letter_df.writeStream
     .format("delta")
     .outputMode("append")
-    .trigger(processingTime="60 seconds")
-    .option("checkpointLocation", deadletter_checkpoint)
-    .toTable("hive_metastore.akhilstream_db.dead_letter_orders")
+    .trigger(processingTime="30 seconds")
+    .option("checkpointLocation", DEADLETTER_CP)
+    .option("mergeSchema", "true")
+    .start(DEADLETTER_DELTA_PATH)
 )
 
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS hive_metastore.akhilstream_db.silver_order_events
+    USING DELTA LOCATION '{SILVER_DELTA_PATH}'
+""")
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS hive_metastore.akhilstream_db.dead_letter_orders
+    USING DELTA LOCATION '{DEADLETTER_DELTA_PATH}'
+""")
+
 # ------------------------------------------------------------------
-# STEP 10 — Monitor stream status
+# STEP 11 — Monitor
 # ------------------------------------------------------------------
 import time
-time.sleep(10)
+time.sleep(15)
 
-print("\n📊 Silver stream status:")
-print("   Is active:", silver_query.isActive)
-print("   Message  :", silver_query.status["message"])
-
-print("\n📊 Dead Letter stream status:")
-print("   Is active:", dead_letter_query.isActive)
-print("   Message  :", dead_letter_query.status["message"])
-
-print("\n⏳ Wait ~2 minutes then verify:")
+print("\n📊 Silver stream  — Is active:", silver_query.isActive)
+print("📊 Dead Letter    — Is active:", dead_letter_query.isActive)
+print("\n⏳ Verify after ~2 minutes:")
 print("   SELECT count(*) FROM akhilstream_db.silver_order_events")
 print("   SELECT count(*) FROM akhilstream_db.dead_letter_orders")
 
 # ------------------------------------------------------------------
-# Sample output after ~2 minutes:
-# SELECT * FROM akhilstream_db.silver_order_events LIMIT 5;
-#
-# +-----------+-------------+-------------+---------------+--------------+--------+-------------+---------------------------+---------------------------+
-# | order_id  | customer_id | category    | order_status  | order_value  | region | quantity    | event_ts                  | processed_at              |
-# +-----------+-------------+-------------+---------------+--------------+--------+-------------+---------------------------+---------------------------+
-# | ORD234891 | CUST_7821   | ELECTRONICS | PLACED        | 299.99       | WEST   | 1           | 2025-07-03 10:45:23       | 2025-07-03 10:46:05       |
-# | ORD234892 | CUST_3312   | FASHION     | SHIPPED       | 49.99        | SOUTH  | 2           | 2025-07-03 10:45:24       | 2025-07-03 10:46:05       |
-# | ORD234893 | CUST_9901   | GROCERY     | DELIVERED     | 18.50        | NORTH  | 5           | 2025-07-03 10:45:25       | 2025-07-03 10:46:05       |
-# +-----------+-------------+-------------+---------------+--------------+--------+-------------+---------------------------+---------------------------+
+# Sample output:
+# silver_order_events — cleaned, typed, standardised
+# dead_letter_orders  — null/invalid records for investigation
 # ------------------------------------------------------------------
